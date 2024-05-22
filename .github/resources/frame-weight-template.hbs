@@ -27,7 +27,6 @@
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
 #![allow(unused_parens)]
-#![allow(double_parens)]
 #![allow(unused_imports)]
 #![allow(missing_docs)]
 
@@ -47,11 +46,7 @@ pub trait WeightInfo {
 
 /// Weights for {{pallet}} using the Substrate node and recommended hardware.
 pub struct SubstrateWeight<T>(PhantomData<T>);
-{{#if (eq pallet "frame_system")}}
-impl<T: crate::Config> {{pallet}}::WeightInfo for SubstrateWeight<T> {
-{{else}}
 impl<T: frame_system::Config> {{pallet}}::WeightInfo for SubstrateWeight<T> {
-{{/if}}
 	{{#each benchmarks as |benchmark|}}
 	{{#each benchmark.comments as |comment|}}
 	/// {{comment}}
