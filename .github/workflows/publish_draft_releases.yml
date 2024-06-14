@@ -114,8 +114,8 @@ jobs:
           rustup default stable
           rustup update
           rustup target add wasm32-unknown-unknown
-          rustup install 1.71.0
-          rustup target add wasm32-unknown-unknown --toolchain 1.71.0
+          rustup install 1.74.0
+          rustup target add wasm32-unknown-unknown --toolchain 1.74.0
       - name: cache cargo
         uses: Swatinem/rust-cache@v2
       - name: build
@@ -127,7 +127,7 @@ jobs:
           SCCACHE_DIR: ~/.cache/sccache
         run: |
           source ${HOME}/.cargo/env
-          RUSTC_BOOTSTRAP=1 cargo +1.71.0 build --profile production --verbose
+          RUSTC_BOOTSTRAP=1 cargo +1.74.0 build --profile production --verbose
       - name: stop sccache server
         run: sccache --stop-server || true
       - if: always()
@@ -184,9 +184,10 @@ jobs:
         with:
           name: ${{ matrix.runtime.name }}-srtool-json
       - name: ruby setup
-        uses: actions/setup-ruby@v1
+        uses: ruby/setup-ruby@v1
         with:
-          ruby-version: 2.7
+          ruby-version: '2.7'
+          bundler-cache: true
       - name: get runtime version
         id: get-runtime-version
         run: |

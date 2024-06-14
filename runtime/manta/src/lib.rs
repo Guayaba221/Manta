@@ -24,32 +24,32 @@
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
-pub use frame_support::traits::{Get, IsInVec};
 use manta_collator_selection::IdentityCollator;
 use sp_api::impl_runtime_apis;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
 use sp_runtime::{
     create_runtime_str, generic, impl_opaque_keys,
-    traits::{AccountIdConversion, AccountIdLookup, BlakeTwo256, Block as BlockT},
+    traits::{AccountIdConversion, AccountIdLookup, BlakeTwo256, Block as BlockT, IdentityLookup},
     transaction_validity::{TransactionSource, TransactionValidity},
-    ApplyExtrinsicResult, Perbill, Percent, Permill,
+    ApplyExtrinsicResult, Perbill, Percent, Permill, RuntimeDebug,
 };
 
 use codec::{Decode, Encode, MaxEncodedLen};
 use cumulus_pallet_parachain_system::{
-    register_validate_block, CheckInherents, ParachainSetCode, RelayChainStateProof,
-    RelaychainDataProvider,
+    register_validate_block, ParachainSetCode, RelayChainStateProof, RelaychainDataProvider,
 };
 use frame_support::{
     construct_runtime,
     dispatch::DispatchClass,
     parameter_types,
     traits::{
-        ConstU128, ConstU32, ConstU8, Contains, Currency, EitherOfDiverse, InstanceFilter,
-        NeverEnsureOrigin, PrivilegeCmp,
+        fungible::HoldConsideration,
+        tokens::{PayFromAccount, UnityAssetBalanceConversion},
+        ConstBool, ConstU128, ConstU32, ConstU8, Contains, Currency, EitherOfDiverse, Get,
+        InstanceFilter, IsInVec, LinearStoragePrice, PrivilegeCmp,
     },
     weights::{ConstantMultiplier, Weight},
-    PalletId, RuntimeDebug,
+    PalletId,
 };
 use sp_std::{cmp::Ordering, prelude::*};
 #[cfg(feature = "std")]
@@ -58,14 +58,14 @@ use sp_version::RuntimeVersion;
 
 use frame_system::{
     limits::{BlockLength, BlockWeights},
-    EnsureRoot, EnsureSigned,
+    EnsureRoot, EnsureSigned, EnsureWithSuccess,
 };
 use manta_primitives::{
     constants::{
         time::*, RocksDbWeight, LOTTERY_PALLET_ID, NAME_SERVICE_PALLET_ID, STAKING_PALLET_ID,
         TREASURY_PALLET_ID, WEIGHT_PER_SECOND,
     },
-    types::{AccountId, Balance, BlockNumber, Hash, Header, Index, PoolId, Signature},
+    types::{AccountId, Balance, BlockNumber, Hash, Header, Nonce, PoolId, Signature},
 };
 use manta_support::manta_pay::{PullResponse, RawCheckpoint};
 pub use pallet_parachain_staking::{InflationInfo, Range};
@@ -145,10 +145,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     spec_name: create_runtime_str!("manta"),
     impl_name: create_runtime_str!("manta"),
     authoring_version: 1,
-    spec_version: 4611,
+    spec_version: 4700,
     impl_version: 1,
     apis: RUNTIME_API_VERSIONS,
-    transaction_version: 7,
+    transaction_version: 8,
     state_version: 1,
 };
 
@@ -269,16 +269,19 @@ impl Contains<RuntimeCall> for MantaFilter {
                 | pallet_parachain_staking::Call::schedule_delegator_bond_less{..}
                 | pallet_parachain_staking::Call::execute_delegation_request{..}
                 | pallet_parachain_staking::Call::cancel_delegation_request{..})
-            | RuntimeCall::XTokens(orml_xtokens::Call::transfer {..}
-                | orml_xtokens::Call::transfer_multiassets {..}
-                | orml_xtokens::Call::transfer_multiasset_with_fee {..})
+            | RuntimeCall::XTokens(_)
             | RuntimeCall::Balances(_)
             | RuntimeCall::Preimage(_)
             | RuntimeCall::MantaSbt(_)
+            | RuntimeCall::Proxy(_)
             | RuntimeCall::NameService(_)
             | RuntimeCall::TransactionPause(_)
             | RuntimeCall::ZenlinkProtocol(_)
             | RuntimeCall::Farming(_)
+            | RuntimeCall::Assets(
+                pallet_assets::Call::transfer {..}
+                | pallet_assets::Call::transfer_keep_alive {..}
+            )
             | RuntimeCall::PolkadotXcm(pallet_xcm::Call::send {..})
             | RuntimeCall::AssetManager(
                 pallet_asset_manager::Call::update_outgoing_filtered_assets {..}
@@ -299,13 +302,13 @@ impl frame_system::Config for Runtime {
     type AccountId = AccountId;
     type RuntimeCall = RuntimeCall;
     type Lookup = AccountIdLookup<AccountId, ()>;
-    type Index = Index;
-    type BlockNumber = BlockNumber;
+    type Nonce = Nonce;
+    type Block = Block;
     type Hash = Hash;
     type Hashing = BlakeTwo256;
-    type Header = Header;
     type RuntimeEvent = RuntimeEvent;
     type RuntimeOrigin = RuntimeOrigin;
+    type RuntimeTask = RuntimeTask;
     type BlockHashCount = BlockHashCount;
     type DbWeight = RocksDbWeight;
     type Version = Version;
@@ -344,9 +347,9 @@ parameter_types! {
 )]
 pub enum ProxyType {
     Any,
-    NonTransfer,
+    TransferNotDie,
     Governance,
-    Staking,
+    Delegation,
 }
 
 impl Default for ProxyType {
@@ -359,14 +362,26 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
     fn filter(&self, c: &RuntimeCall) -> bool {
         match self {
             ProxyType::Any => true,
-            ProxyType::NonTransfer => !matches!(c, RuntimeCall::Balances(..)),
-            ProxyType::Governance => matches!(
+            ProxyType::TransferNotDie => !matches!(
+                c,
+                RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death { .. })
+            ), // proxy account cannot transfer all
+            ProxyType::Governance => !matches!(
                 c,
                 RuntimeCall::Democracy(..)
                     | RuntimeCall::Council(..)
                     | RuntimeCall::TechnicalCommittee(..)
-            ),
-            ProxyType::Staking => matches!(c, RuntimeCall::ParachainStaking(..)),
+            ), // we don't allow proxy call in governance
+            ProxyType::Delegation => matches!(
+                c,
+                RuntimeCall::ParachainStaking(pallet_parachain_staking::Call::delegate { .. })
+                    | RuntimeCall::ParachainStaking(
+                        pallet_parachain_staking::Call::schedule_revoke_delegation { .. }
+                    )
+                    | RuntimeCall::ParachainStaking(
+                        pallet_parachain_staking::Call::execute_delegation_request { .. }
+                    )
+            ), // only allow delegation & undelegation in staking
         }
     }
     fn is_superset(&self, o: &Self) -> bool {
@@ -374,7 +389,6 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
             (x, y) if x == y => true,
             (ProxyType::Any, _) => true,
             (_, ProxyType::Any) => false,
-            (ProxyType::NonTransfer, _) => true,
             _ => false,
         }
     }
@@ -388,7 +402,7 @@ impl pallet_proxy::Config for Runtime {
     type ProxyDepositBase = ProxyDepositBase;
     type ProxyDepositFactor = ProxyDepositFactor;
     type MaxProxies = ConstU32<32>;
-    type WeightInfo = ();
+    type WeightInfo = weights::pallet_proxy::SubstrateWeight<Runtime>;
     type MaxPending = ConstU32<32>;
     type CallHasher = BlakeTwo256;
     type AnnouncementDepositBase = AnnouncementDepositBase;
@@ -513,6 +527,11 @@ parameter_types! {
     pub const NativeTokenExistentialDeposit: u128 = 10 * cMANTA; // 0.1 MANTA
 }
 
+#[cfg(feature = "runtime-benchmarks")]
+parameter_types! {
+    pub const BenchmarksNativeTokenExistentialDeposit: u128 = 10;
+}
+
 impl pallet_balances::Config for Runtime {
     type MaxLocks = ConstU32<50>;
     type MaxReserves = ConstU32<50>;
@@ -520,12 +539,16 @@ impl pallet_balances::Config for Runtime {
     type Balance = Balance;
     type DustRemoval = ();
     type RuntimeEvent = RuntimeEvent;
+    #[cfg(not(feature = "runtime-benchmarks"))]
     type ExistentialDeposit = NativeTokenExistentialDeposit;
+    #[cfg(feature = "runtime-benchmarks")]
+    type ExistentialDeposit = BenchmarksNativeTokenExistentialDeposit;
     type AccountStore = frame_system::Pallet<Runtime>;
     type WeightInfo = weights::pallet_balances::SubstrateWeight<Runtime>;
     type FreezeIdentifier = ();
     type MaxFreezes = ();
-    type HoldIdentifier = ();
+    type RuntimeHoldReason = RuntimeHoldReason;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
     type MaxHolds = ConstU32<50>;
 }
 
@@ -693,6 +716,8 @@ parameter_types! {
     pub const PreimageBaseDeposit: Balance = 40 * mMANTA;
     // One cent: $10,000 / MB
     pub const PreimageByteDeposit: Balance = 400 * uMANTA;
+    pub const PreimageHoldReason: RuntimeHoldReason =
+        RuntimeHoldReason::Preimage(pallet_preimage::HoldReason::Preimage);
 }
 
 impl pallet_preimage::Config for Runtime {
@@ -700,8 +725,12 @@ impl pallet_preimage::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type Currency = Balances;
     type ManagerOrigin = EnsureRoot<AccountId>;
-    type BaseDeposit = PreimageBaseDeposit;
-    type ByteDeposit = PreimageByteDeposit;
+    type Consideration = HoldConsideration<
+        AccountId,
+        Balances,
+        PreimageHoldReason,
+        LinearStoragePrice<PreimageBaseDeposit, PreimageByteDeposit, Balance>,
+    >;
 }
 
 // NOTE: pallet_parachain_staking rounds are now used,
@@ -737,6 +766,9 @@ impl pallet_aura::Config for Runtime {
     type AuthorityId = AuraId;
     type DisabledValidators = ();
     type MaxAuthorities = ConstU32<100_000>;
+    // false means async backing is disabled
+    // https://forum.polkadot.network/t/polkadot-release-analysis-v1-0-0/3585#pallet-aura-allow-multiple-blocks-per-slot-12
+    type AllowMultipleBlocksPerSlot = ConstBool<false>;
 }
 
 parameter_types! {
@@ -905,6 +937,8 @@ parameter_types! {
     pub SpendPeriod: BlockNumber = prod_or_fast!(14 * DAYS, 2 * MINUTES, "MANTA_SPEND_PERIOD");
     pub const Burn: Permill = Permill::from_percent(0);
     pub const TreasuryPalletId: PalletId = TREASURY_PALLET_ID;
+    pub const PayoutSpendPeriod: BlockNumber = 30 * DAYS;
+    pub const MaxBalance: Balance = Balance::max_value();
 }
 
 type EnsureRootOrThreeFifthsCouncil = EitherOfDiverse<
@@ -935,7 +969,15 @@ impl pallet_treasury::Config for Runtime {
     type SpendFunds = ();
     // Expects an implementation of `EnsureOrigin` with a `Success` generic,
     // which is the the maximum amount that this origin is allowed to spend at a time.
-    type SpendOrigin = NeverEnsureOrigin<Balance>;
+    type SpendOrigin = EnsureWithSuccess<EnsureRoot<AccountId>, AccountId, MaxBalance>;
+    type Beneficiary = AccountId;
+    type BeneficiaryLookup = IdentityLookup<Self::Beneficiary>;
+    type Paymaster = PayFromAccount<Balances, TreasuryAccount>;
+    type BalanceConverter = UnityAssetBalanceConversion;
+    type PayoutPeriod = PayoutSpendPeriod;
+    type AssetKind = ();
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = ();
 }
 
 parameter_types! {
@@ -978,7 +1020,8 @@ impl pallet_name_service::Config for Runtime {
 impl parachain_info::Config for Runtime {}
 
 struct CheckInherentsStruct;
-impl CheckInherents<Block> for CheckInherentsStruct {
+#[allow(deprecated)]
+impl cumulus_pallet_parachain_system::CheckInherents<Block> for CheckInherentsStruct {
     fn check_inherents(
         block: &Block,
         relay_state_proof: &RelayChainStateProof,
@@ -1001,18 +1044,15 @@ impl CheckInherents<Block> for CheckInherentsStruct {
 
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
-    pub enum Runtime where
-        Block = Block,
-        NodeBlock = opaque::Block,
-        UncheckedExtrinsic = UncheckedExtrinsic,
+    pub enum Runtime
     {
         // System support stuff.
-        System: frame_system::{Pallet, Call, Config, Storage, Event<T>} = 0,
+        System: frame_system::{Pallet, Call, Config<T>, Storage, Event<T>} = 0,
         ParachainSystem: cumulus_pallet_parachain_system::{
-            Pallet, Call, Config, Storage, Inherent, Event<T>, ValidateUnsigned,
+            Pallet, Call, Config<T>, Storage, Inherent, Event<T>, ValidateUnsigned,
         } = 1,
         Timestamp: pallet_timestamp::{Pallet, Call, Storage, Inherent} = 2,
-        ParachainInfo: parachain_info::{Pallet, Storage, Config} = 3,
+        ParachainInfo: parachain_info::{Pallet, Storage, Config<T>} = 3,
         TransactionPause: pallet_tx_pause::{Pallet, Call, Storage, Event<T>} = 9,
 
         // Monetary stuff.
@@ -1039,15 +1079,16 @@ construct_runtime!(
         Treasury: pallet_treasury::{Pallet, Call, Storage, Event<T>} = 26,
 
         // Preimage registry.
-        Preimage: pallet_preimage::{Pallet, Call, Storage, Event<T>} = 28,
+        Preimage: pallet_preimage::{Pallet, Call, Storage, Event<T>, HoldReason} = 28,
         Scheduler: pallet_scheduler::{Pallet, Call, Storage, Event<T>} = 29,
 
         // XCM helpers.
         XcmpQueue: cumulus_pallet_xcmp_queue::{Pallet, Call, Storage, Event<T>} = 30,
-        PolkadotXcm: pallet_xcm::{Pallet, Call, Storage, Event<T>, Origin, Config} = 31,
+        PolkadotXcm: pallet_xcm::{Pallet, Call, Storage, Event<T>, Origin, Config<T>} = 31,
         CumulusXcm: cumulus_pallet_xcm::{Pallet, Event<T>, Origin} = 32,
         DmpQueue: cumulus_pallet_dmp_queue::{Pallet, Call, Storage, Event<T>} = 33,
         XTokens: orml_xtokens::{Pallet, Call, Event<T>, Storage} = 34,
+        MessageQueue: pallet_message_queue::{Pallet, Call, Storage, Event<T>} = 35,
 
         // Handy utilities.
         Utility: pallet_utility::{Pallet, Call, Event} = 40,
@@ -1099,7 +1140,7 @@ pub type CheckedExtrinsic = generic::CheckedExtrinsic<AccountId, RuntimeCall, Si
 
 /// Types for runtime upgrading.
 /// Each type should implement trait `OnRuntimeUpgrade`.
-pub type OnRuntimeUpgradeHooks = ();
+pub type OnRuntimeUpgradeHooks = cumulus_pallet_xcmp_queue::migration::v4::MigrationToV4<Runtime>;
 /// Executive: handles dispatch to the various modules.
 pub type Executive = frame_executive::Executive<
     Runtime,
@@ -1109,10 +1150,6 @@ pub type Executive = frame_executive::Executive<
     AllPalletsWithSystem,
     OnRuntimeUpgradeHooks,
 >;
-
-#[cfg(feature = "runtime-benchmarks")]
-#[macro_use]
-extern crate frame_benchmarking;
 
 #[cfg(feature = "runtime-benchmarks")]
 mod benches {
@@ -1125,7 +1162,7 @@ mod benches {
         [pallet_multisig, Multisig]
         // always get this error ValidationDataNotAvailable while benchmarking
         // we disable frame_system in this release, and will fix it in next release
-        // [frame_system, SystemBench::<Runtime>]
+        [frame_system, SystemBench::<Runtime>]
         [pallet_timestamp, Timestamp]
         [pallet_utility, Utility]
         [pallet_preimage, Preimage]
@@ -1137,7 +1174,6 @@ mod benches {
         [pallet_sudo, Sudo]
         // XCM
         [cumulus_pallet_xcmp_queue, XcmpQueue]
-        [pallet_xcm, PolkadotXcm]
         // always get this error(Unimplemented) while benchmarking pallet_xcm_benchmarks::fungible::initiate_teleport
         // so this time we will use statemint's fungible weights
         // [pallet_xcm_benchmarks::fungible, XcmBalances]
@@ -1156,7 +1192,7 @@ mod benches {
         // [zenlink_protocol, ZenlinkProtocol]
         [pallet_farming, Farming]
         // Nimbus pallets
-        [pallet_author_inherent, AuthorInherent]
+        // [pallet_author_inherent, AuthorInherent]
     );
 }
 
@@ -1250,8 +1286,8 @@ impl_runtime_apis! {
         }
     }
 
-    impl frame_system_rpc_runtime_api::AccountNonceApi<Block, AccountId, Index> for Runtime {
-        fn account_nonce(account: AccountId) -> Index {
+    impl frame_system_rpc_runtime_api::AccountNonceApi<Block, AccountId, Nonce> for Runtime {
+        fn account_nonce(account: AccountId) -> Nonce {
             System::account_nonce(account)
         }
     }
@@ -1323,6 +1359,11 @@ impl_runtime_apis! {
         fn can_author(author: NimbusId, relay_parent: u32, parent_header: &<Block as BlockT>::Header) -> bool {
             let next_block_number = parent_header.number + 1;
             let slot = relay_parent;
+            if cumulus_pallet_parachain_system::Pallet::<Self>::last_relay_block_number() + 1 == relay_parent {
+                log::debug!("Cannot Author blocks on consecutive slots");
+                return false
+            }
+
             // Because the staking solution calculates the next staking set at the beginning
             // of the first block in the new round, the only way to accurately predict the
             // authors is to compute the selection during prediction.
@@ -1356,6 +1397,30 @@ impl_runtime_apis! {
                 // We're not changing rounds, `PotentialAuthors` is not changing, just use can_author
                 <AuthorInherent as nimbus_primitives::CanAuthor<_>>::can_author(&author, &relay_parent)
             }
+        }
+    }
+
+    impl session_keys_primitives::VrfApi<Block> for Runtime {
+        fn get_last_vrf_output() -> Option<<Block as BlockT>::Hash> {
+            // We don't use vrf in consensus right now
+            None
+        }
+        fn vrf_key_lookup(
+            _nimbus_id: nimbus_primitives::NimbusId
+        ) -> Option<session_keys_primitives::VrfId> {
+            // no vrf used in consensus
+            None
+        }
+    }
+
+    impl async_backing_primitives::UnincludedSegmentApi<Block> for Runtime {
+        fn can_build_upon(
+            _included_hash: <Block as BlockT>::Hash,
+            _slot: async_backing_primitives::Slot,
+        ) -> bool {
+            // This runtime API can be called only when asynchronous backing is enabled client-side
+            // We return false here to force the client to not use async backing.
+            false
         }
     }
 
@@ -1470,8 +1535,8 @@ impl_runtime_apis! {
             use frame_benchmarking::{Benchmarking, BenchmarkList};
             use frame_support::traits::StorageInfoTrait;
             use cumulus_pallet_session_benchmarking::Pallet as SessionBench;
+            use frame_system_benchmarking::Pallet as SystemBench;
 
-            // type XcmBalances = pallet_xcm_benchmarks::fungible::Pallet::<Runtime>;
             type XcmGeneric = pallet_xcm_benchmarks::generic::Pallet::<Runtime>;
 
             let mut list = Vec::<BenchmarkList>::new();
@@ -1484,14 +1549,24 @@ impl_runtime_apis! {
         fn dispatch_benchmark(
             config: frame_benchmarking::BenchmarkConfig
         ) -> Result<Vec<frame_benchmarking::BenchmarkBatch>, sp_runtime::RuntimeString> {
-            use frame_benchmarking::{Benchmarking, BenchmarkBatch, TrackedStorageKey, BenchmarkError};
+            use frame_benchmarking::{Benchmarking, BenchmarkBatch, BenchmarkError};
+            use frame_support::traits::TrackedStorageKey;
 
-            impl frame_system_benchmarking::Config for Runtime {}
+            use frame_system_benchmarking::Pallet as SystemBench;
+            impl frame_system_benchmarking::Config for Runtime {
+                fn setup_set_code_requirements(code: &sp_std::vec::Vec<u8>) -> Result<(), BenchmarkError> {
+                    ParachainSystem::initialize_for_set_code_benchmark(code.len() as u32);
+                    Ok(())
+                }
+
+                fn verify_set_code() {
+                    System::assert_last_event(cumulus_pallet_parachain_system::Event::<Runtime>::ValidationFunctionStored.into());
+                }
+            }
 
             use cumulus_pallet_session_benchmarking::Pallet as SessionBench;
             impl cumulus_pallet_session_benchmarking::Config for Runtime {}
 
-            use pallet_xcm_benchmarks::asset_instance_from;
             use xcm_config::{LocationToAccountId, XcmExecutorConfig};
 
             parameter_types! {
@@ -1507,13 +1582,38 @@ impl_runtime_apis! {
                 pub const CheckedAccount: Option<(AccountId, xcm_builder::MintLocation)> = None;
                 pub const DotLocation: MultiLocation = MultiLocation::parent();
                 pub MantaLocation: MultiLocation = MultiLocation::new(1, X1(Parachain(ParachainInfo::parachain_id().into())));
+                pub ExistentialDepositAsset: Option<MultiAsset> = Some(MultiAsset {
+                    id: Concrete(MultiLocation::parent()),
+                    fun: Fungible(NativeTokenExistentialDeposit::get())
+                });
+
             }
 
             impl pallet_xcm_benchmarks::Config for Runtime {
                 type XcmConfig = XcmExecutorConfig;
                 type AccountIdConverter = LocationToAccountId;
+                type DeliveryHelper = cumulus_primitives_utility::ToParentDeliveryHelper<
+                    XcmExecutorConfig,
+                    ExistentialDepositAsset,
+                    (),
+                >;
 
                 fn valid_destination() -> Result<MultiLocation, BenchmarkError> {
+                    let assets = vec![
+                        MultiAsset {
+                            id: Concrete(DotLocation::get()),
+                            fun: Fungible(1_000_000 * MANTA),
+                        }
+                    ];
+
+                    for (i, asset) in assets.iter().enumerate() {
+                        if let MultiAsset {
+                            id: Concrete(location),
+                            fun: Fungible(_)
+                        } = asset {
+                            pallet_asset_manager::benchmarking::register_asset_helper::<Runtime>(*location, i as u32);
+                        }
+                    }
                     Ok(DotLocation::get())
                 }
 
@@ -1530,25 +1630,35 @@ impl_runtime_apis! {
                             }
                         })
                         .chain(core::iter::once(MultiAsset { id: Concrete(Here.into()), fun: Fungible(u128::MAX) }))
-                        .chain((0..holding_non_fungibles).map(|i| MultiAsset {
-                            id: Concrete(GeneralIndex(i as u128).into()),
-                            fun: NonFungible(asset_instance_from(i)),
-                        }))
                         .collect::<Vec<_>>();
 
                     assets.push(MultiAsset {
                         id: Concrete(DotLocation::get()),
                         fun: Fungible(1_000_000 * MANTA),
                     });
+                    assets.push(MultiAsset {
+                        id: Concrete(MantaLocation::get()),
+                        fun: Fungible(1_000_000 * MANTA),
+                    });
+
+                    for (i, asset) in assets.iter().enumerate() {
+                        if let MultiAsset {
+                            id: Concrete(location),
+                            fun: Fungible(_)
+                        } = asset {
+                            pallet_asset_manager::benchmarking::register_asset_helper::<Runtime>(*location, i as u32);
+                        }
+                    }
+
                     assets.into()
                 }
             }
 
             impl pallet_xcm_benchmarks::fungible::Config for Runtime {
                 type TransactAsset = Balances;
-
                 type CheckedAccount = CheckedAccount;
                 type TrustedTeleporter = TrustedTeleporter;
+                type TrustedReserve = TrustedReserve;
 
                 fn get_multi_asset() -> MultiAsset {
                     MultiAsset {
@@ -1560,6 +1670,7 @@ impl_runtime_apis! {
 
             impl pallet_xcm_benchmarks::generic::Config for Runtime {
                 type RuntimeCall = RuntimeCall;
+                type TransactAsset = Balances;
 
                 fn worst_case_response() -> (u64, Response) {
                     (0u64, Response::Version(Default::default()))
@@ -1596,9 +1707,12 @@ impl_runtime_apis! {
                 ) -> Result<(MultiLocation, NetworkId, InteriorMultiLocation), BenchmarkError> {
                     Err(BenchmarkError::Skip)
                 }
+
+                fn alias_origin() -> Result<(MultiLocation, MultiLocation), BenchmarkError> {
+                    Err(BenchmarkError::Skip)
+                }
             }
 
-            // type XcmBalances = pallet_xcm_benchmarks::fungible::Pallet::<Runtime>;
             type XcmGeneric = pallet_xcm_benchmarks::generic::Pallet::<Runtime>;
 
             let whitelist: Vec<TrackedStorageKey> = vec![
@@ -1630,5 +1744,5 @@ impl_runtime_apis! {
 register_validate_block! {
     Runtime = Runtime,
     BlockExecutor = pallet_author_inherent::BlockExecutor::<Runtime, Executive>,
-    CheckInherents = CheckInherentsStruct,
+    CheckInherents = CheckInherentsStruct
 }

@@ -59,8 +59,8 @@ jobs:
           protoc --version
           curl -s https://sh.rustup.rs -sSf | sh -s -- -y
           source ${HOME}/.cargo/env
-          rustup toolchain install 1.71.0
-          rustup default 1.71.0
+          rustup toolchain install 1.74.0
+          rustup default 1.74.0
           rustup target add wasm32-unknown-unknown
       - name: cache cargo
         uses: Swatinem/rust-cache@v2
@@ -78,8 +78,9 @@ jobs:
           chmod +x $HOME/manta
       - name: Fetch and chmod old release binary
         run: |
-          curl -L -o $HOME/polkadot https://github.com/paritytech/polkadot/releases/download/v1.3.0/polkadot
+          curl -L -o $HOME/polkadot https://github.com/paritytech/polkadot-sdk/releases/download/polkadot-v1.8.0/polkadot
           chmod +x $HOME/polkadot
+          $HOME/polkadot --version
           ls -ahl $HOME/
       - name: stop sccache server
         run: sccache --stop-server || true

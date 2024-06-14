@@ -14,7 +14,7 @@ function_name = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server", "macros"], optional = true }
 log = { workspace = true }
 scale-info = { workspace = true }
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 
 # Substrate dependencies
 frame-support = { workspace = true }
@@ -69,6 +69,7 @@ runtime-benchmarks = [
   'rand/std_rng',
 ]
 std = [
+  "log/std",
   "manta-primitives/std",
   "pallet-parachain-staking/std",
   "pallet-randomness/std",
@@ -87,7 +88,6 @@ std = [
   "runtime-common/std",
   "codec/std",
   "scale-info/std",
-  "log/std",
   "sp-staking/std",
 ]
 try-runtime = [

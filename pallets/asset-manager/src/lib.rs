@@ -27,8 +27,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(feature = "runtime-benchmarks")]
-mod benchmarking;
-pub mod migrations;
+pub mod benchmarking;
 pub mod weights;
 
 #[cfg(test)]
@@ -204,7 +203,6 @@ pub mod pallet {
         pub start_id: T::AssetId,
     }
 
-    #[cfg(feature = "std")]
     impl<T: Config> Default for GenesisConfig<T> {
         #[inline]
         fn default() -> Self {
@@ -215,7 +213,7 @@ pub mod pallet {
     }
 
     #[pallet::genesis_build]
-    impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
+    impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
         #[inline]
         fn build(&self) {
             assert!(
@@ -699,8 +697,8 @@ pub mod pallet {
             T::ModifierOrigin::ensure_origin(origin)?;
             ensure!(asset_0 != asset_1, Error::<T>::AssetIdNotDifferent);
             ensure!(
-                AssetIdLocation::<T>::contains_key(asset_0)
-                    && AssetIdLocation::<T>::contains_key(asset_1),
+                AssetIdMetadata::<T>::contains_key(asset_0)
+                    && AssetIdMetadata::<T>::contains_key(asset_1),
                 Error::<T>::AssetIdNotExist
             );
 
