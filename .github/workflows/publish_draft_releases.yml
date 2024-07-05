@@ -48,10 +48,13 @@ jobs:
       - name: build runtime
         id: srtool-build
         uses: chevdor/srtool-actions@v0.9.1
+        env:
+          BUILD_OPTS: "--features on-chain-release-build"
         with:
           image: paritytech/srtool
           tag: 1.74.0
           chain: ${{ matrix.runtime.name }}
+          profile: "production"
       - name: persist srtool digest
         run: >
           echo '${{ steps.srtool-build.outputs.json }}' |
